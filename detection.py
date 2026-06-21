@@ -48,16 +48,17 @@ PLATFORM_TOP_Z = 0.28                        # marker height above ground (m)
 FWD_SIGN   = -1.0
 RIGHT_SIGN = +1.0
 
-HOVER_ALT    = 4.0           # altitude to hover at (m AGL)
+HOVER_ALT    = 5.0           # takeoff / search / hover altitude (m AGL)
+SEARCH_SPEED = 4.5           # max horizontal speed while searching (m/s)
 LOST_TIMEOUT = 3.0           # s without detection before resuming SEARCH
 
 # --- Descent ---
 STABILIZE_TIME = 4.0         # s to stabilize over the pad before descending
 DESCENT_SPEED  = 0.1         # m/s average descent rate
-DESCENT_MIN_AGL = 0.4        # stop descending at this height above ground (m)
+TOUCHDOWN_HEIGHT = 0.25      # cut motors at this height above the marker (m)
 # Pad next-position prediction = 75% current frame + 25% previous frame.
-PRED_CURR_W = 0.75
-PRED_PREV_W = 0.25
+PRED_CURR_W = 0.80
+PRED_PREV_W = 0.20
 
 # Search lawnmower (NED, relative to takeoff origin)
 SEARCH_WPS = [
@@ -75,7 +76,7 @@ HELP = """
 
 
 class HoverController(Node):
-    INIT, TAKEOFF, SEARCH, HOVER, DESCEND = range(5)
+    INIT, TAKEOFF, SEARCH, HOVER, DESCEND, LANDED = range(6)
 
     def __init__(self):
         super().__init__('hover_controller')
@@ -187,7 +188,7 @@ class HoverController(Node):
 
     # ---------------------------------------------------------------- helpers
     def _state_name(self):
-        return ['INIT', 'TAKEOFF', 'SEARCH', 'HOVER', 'DESCEND'][self.state]
+        return ['INIT', 'TAKEOFF', 'SEARCH', 'HOVER', 'DESCEND', 'LANDED'][self.state]
 
     def _predicted_marker(self):
         """Pad next position = 75% current frame + 25% previous frame."""
@@ -230,6 +231,36 @@ class HoverController(Node):
         sp.timestamp = now_us
         sp.position = [float(n), float(e), float(d)]
         sp.yaw = float('nan')
+        self.traj_pub.publish(sp)
+
+    def _publish_velocity_xy(self, gn, ge, d):
+        """Fly toward (gn, ge) at <= SEARCH_SPEED while holding altitude d.
+
+        Horizontal axes use velocity control (speed-limited), altitude uses
+        position control. Decelerates within the last SEARCH_SPEED metres.
+        """
+        lp = self.local_pos
+        dn, de = gn - lp.x, ge - lp.y
+        dist = math.hypot(dn, de)
+        if dist < 1e-3:
+            vn = ve = 0.0
+        else:
+            speed = min(SEARCH_SPEED, dist)      # ease off near the goal
+            vn, ve = speed * dn / dist, speed * de / dist
+
+        now_us = int(self.get_clock().now().nanoseconds / 1000)
+        ob = OffboardControlMode()
+        ob.timestamp = now_us
+        ob.position = True
+        ob.velocity = True
+        self.offboard_pub.publish(ob)
+
+        nan = float('nan')
+        sp = TrajectorySetpoint()
+        sp.timestamp = now_us
+        sp.position = [nan, nan, float(d)]       # hold altitude only
+        sp.velocity = [float(vn), float(ve), nan]
+        sp.yaw = nan
         self.traj_pub.publish(sp)
 
     # ---------------------------------------------------------------- main loop
@@ -281,7 +312,7 @@ class HoverController(Node):
             tn, te = self.takeoff_xy
             wn, we = SEARCH_WPS[self.wp_idx]
             gn, ge = tn + wn, te + we
-            self._publish_setpoint(gn, ge, self.target_z)
+            self._publish_velocity_xy(gn, ge, self.target_z)   # speed-limited
             if math.hypot(lp.x - gn, lp.y - ge) < WP_REACH_TOL:
                 self.wp_idx = (self.wp_idx + 1) % len(SEARCH_WPS)
 
@@ -303,12 +334,17 @@ class HoverController(Node):
         elif self.state == self.DESCEND:
             pred = self._predicted_marker()
             agl = (lp.z - self.origin_z) * -1.0
-            if pred is not None and seen_recently:
+            height_above_marker = agl - PLATFORM_TOP_Z
+            if height_above_marker <= TOUCHDOWN_HEIGHT:
+                # ~25 cm above the marker: cut motors and drop onto the pad.
+                self.send_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+                                  param1=0.0, param2=21196.0)   # force disarm
+                self.state = self.LANDED
+                self.get_logger().info(
+                    f'{TOUCHDOWN_HEIGHT*100:.0f} cm above marker -> MOTORS OFF, landed')
+            elif pred is not None and seen_recently:
                 # Step the altitude target down at the average descent speed.
-                if agl > DESCENT_MIN_AGL:
-                    self.target_z += DESCENT_SPEED * 0.02      # 50 Hz tick
-                # Clamp so we never command below the floor altitude.
-                self.target_z = min(self.target_z, self.origin_z - DESCENT_MIN_AGL)
+                self.target_z += DESCENT_SPEED * 0.02          # 50 Hz tick
                 self._publish_setpoint(pred[0], pred[1], self.target_z)
             else:
                 # Lost the pad mid-descent: stop sinking, hold, then re-search.
@@ -317,6 +353,9 @@ class HoverController(Node):
                     self.state = self.SEARCH
                     self.target_z = lp.z - HOVER_ALT
                     self.get_logger().warn('Lost during descent -> SEARCH')
+
+        elif self.state == self.LANDED:
+            return   # motors off, mission complete
 
     # ---------------------------------------------------------------- keyboard
     def handle_key(self, key):
