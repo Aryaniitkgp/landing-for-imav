@@ -60,6 +60,13 @@ TOUCHDOWN_HEIGHT = 0.25      # cut motors at this height above the marker (m)
 PRED_CURR_W = 0.80
 PRED_PREV_W = 0.20
 
+# --- PID gains: horizontal position error [m] -> velocity command [m/s] ---
+KP_XY, KI_XY, KD_XY = 1.2, 0.05, 0.20
+VEL_MAX_XY = 2.0             # clamp on tracking velocity (m/s)
+# Vertical position error [m] -> velocity command [m/s] (altitude hold)
+KP_Z, KI_Z, KD_Z = 1.0, 0.0, 0.10
+VEL_MAX_Z = 1.0
+
 # Search lawnmower (NED, relative to takeoff origin)
 SEARCH_WPS = [
     (0.0, 0.0), (8.0, 0.0), (8.0, 3.0), (0.0, 3.0),
@@ -73,6 +80,29 @@ HELP = """
   Keys:  P pause/hover   R resume   X quit
 =====================================================
 """.format(tid=TARGET_ID)
+
+
+class PID:
+    """Scalar PID with integral anti-windup and output clamping."""
+    def __init__(self, kp, ki, kd, out_limit):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_limit = out_limit
+        self.integral = 0.0
+        self.prev_err = None
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = None
+
+    def update(self, err, dt):
+        self.integral += err * dt
+        # anti-windup: keep the integral term within the output range
+        i_lim = self.out_limit / self.ki if self.ki > 1e-9 else 0.0
+        self.integral = max(-i_lim, min(i_lim, self.integral))
+        deriv = 0.0 if self.prev_err is None else (err - self.prev_err) / dt
+        self.prev_err = err
+        out = self.kp * err + self.ki * self.integral + self.kd * deriv
+        return max(-self.out_limit, min(self.out_limit, out))
 
 
 class HoverController(Node):
@@ -123,6 +153,11 @@ class HoverController(Node):
         self.running = True
         self.tick = 0
         self.lock = threading.Lock()
+
+        # Outer-loop PID controllers (position error -> velocity command).
+        self.pid_n = PID(KP_XY, KI_XY, KD_XY, VEL_MAX_XY)
+        self.pid_e = PID(KP_XY, KI_XY, KD_XY, VEL_MAX_XY)
+        self.pid_z = PID(KP_Z, KI_Z, KD_Z, VEL_MAX_Z)
 
         self.create_timer(0.02, self._control_loop)
         print(HELP)
@@ -263,6 +298,29 @@ class HoverController(Node):
         sp.yaw = nan
         self.traj_pub.publish(sp)
 
+    def _publish_velocity(self, vn, ve, vd):
+        """Full velocity-setpoint command (used by the PID tracker)."""
+        now_us = int(self.get_clock().now().nanoseconds / 1000)
+        ob = OffboardControlMode()
+        ob.timestamp = now_us
+        ob.velocity = True
+        self.offboard_pub.publish(ob)
+
+        nan = float('nan')
+        sp = TrajectorySetpoint()
+        sp.timestamp = now_us
+        sp.position = [nan, nan, nan]
+        sp.velocity = [float(vn), float(ve), float(vd)]
+        sp.yaw = nan
+        self.traj_pub.publish(sp)
+
+    def _pid_track(self, pred, vd):
+        """PID on horizontal marker error -> velocity. vd = vertical velocity."""
+        lp = self.local_pos
+        vn = self.pid_n.update(pred[0] - lp.x, 0.02)
+        ve = self.pid_e.update(pred[1] - lp.y, 0.02)
+        self._publish_velocity(vn, ve, vd)
+
     # ---------------------------------------------------------------- main loop
     def _control_loop(self):
         if self.local_pos is None:
@@ -299,6 +357,7 @@ class HoverController(Node):
                 and self.state in (self.TAKEOFF, self.SEARCH)):
             self.state = self.HOVER
             self.hover_enter = now
+            self.pid_n.reset(); self.pid_e.reset(); self.pid_z.reset()
             self.get_logger().info('Target found -> HOVER over it')
 
         if self.state == self.TAKEOFF:
@@ -319,11 +378,12 @@ class HoverController(Node):
         elif self.state == self.HOVER:
             pred = self._predicted_marker()
             if pred is not None and seen_recently:
-                self._publish_setpoint(pred[0], pred[1], self.target_z)
+                # PID horizontal tracking, PID altitude hold at target_z.
+                vz = self.pid_z.update(self.target_z - lp.z, 0.02)
+                self._pid_track(pred, vz)
                 # Hold over the pad for STABILIZE_TIME, then start descending.
                 if now - self.hover_enter > STABILIZE_TIME:
                     self.state = self.DESCEND
-                    self.target_z = lp.z       # begin descent from current alt
                     self.get_logger().info('Stabilized -> DESCEND @ 0.1 m/s')
             else:
                 self._publish_setpoint(lp.x, lp.y, self.target_z)
@@ -343,9 +403,8 @@ class HoverController(Node):
                 self.get_logger().info(
                     f'{TOUCHDOWN_HEIGHT*100:.0f} cm above marker -> MOTORS OFF, landed')
             elif pred is not None and seen_recently:
-                # Step the altitude target down at the average descent speed.
-                self.target_z += DESCENT_SPEED * 0.02          # 50 Hz tick
-                self._publish_setpoint(pred[0], pred[1], self.target_z)
+                # PID horizontal tracking + constant 0.1 m/s descent.
+                self._pid_track(pred, DESCENT_SPEED)
             else:
                 # Lost the pad mid-descent: stop sinking, hold, then re-search.
                 self._publish_setpoint(lp.x, lp.y, lp.z)
